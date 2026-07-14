@@ -16,6 +16,11 @@ struct PopoverView: View {
                                 titles: appState.sessionTitles,
                                 billedAccounts: appState.sessionBilledAccounts, now: context.date)
                 Divider()
+                CodexAccountsSection(accounts: appState.codexAccounts, states: appState.codexUsage,
+                                     now: context.date, onSwitch: { account in
+                    Task { await appState.switchCodexAccount(account) }
+                })
+                Divider()
                 AccountsSection(accounts: appState.visibleAccounts,
                                 states: appState.usageStore.states,
                                 yellowAt: appState.yellowAt, redAt: appState.redAt,

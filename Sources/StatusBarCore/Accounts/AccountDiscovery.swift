@@ -33,12 +33,19 @@ public enum AccountDiscovery {
     /// `claude`-managed credentials file when no native accounts have been
     /// captured yet (see `AppState.resolveAccounts()`, which prefers
     /// `NativeAccountStore` and only calls this as the pre-native-account
-    /// fallback).
-    public static func discover(credentialsFile: URL) -> [Account] {
-        guard FileManager.default.fileExists(atPath: credentialsFile.path) else {
-            return []
+    /// fallback). Current Claude Code versions may keep the live login only
+    /// in Keychain, so the non-interactive Keychain reader is also accepted
+    /// as proof of a default account when the legacy file is absent.
+    public static func discover(
+        credentialsFile: URL,
+        keychainReader: (String) -> Data? = defaultKeychainReader
+    ) -> [Account] {
+        if FileManager.default.fileExists(atPath: credentialsFile.path) {
+            return [Account(id: "default", alias: nil, email: nil, slot: nil,
+                            isActive: true, oauthURL: credentialsFile)]
         }
-        return [Account(id: "default", alias: nil, email: nil, slot: nil,
+        guard keychainAccessToken(reader: keychainReader) != nil else { return [] }
+        return [Account(id: "default", alias: "Claude Code", email: nil, slot: nil,
                         isActive: true, oauthURL: credentialsFile)]
     }
 

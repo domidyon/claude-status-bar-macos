@@ -28,8 +28,22 @@ private func makeTempDir() -> URL {
         let tmp = makeTempDir()
         defer { try? FileManager.default.removeItem(at: tmp) }
         let accounts = AccountDiscovery.discover(
-            credentialsFile: tmp.appendingPathComponent("none.json"))
+            credentialsFile: tmp.appendingPathComponent("none.json"),
+            keychainReader: { _ in nil })
         #expect(accounts.isEmpty)
+    }
+
+    @Test func discoversKeychainOnlyClaudeLogin() {
+        let tmp = makeTempDir()
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let accounts = AccountDiscovery.discover(
+            credentialsFile: tmp.appendingPathComponent("none.json"),
+            keychainReader: { _ in
+                Data(#"{"claudeAiOauth":{"accessToken":"keychain-token"}}"#.utf8)
+            })
+        #expect(accounts.count == 1)
+        #expect(accounts[0].alias == "Claude Code")
+        #expect(accounts[0].isActive)
     }
 }
 
