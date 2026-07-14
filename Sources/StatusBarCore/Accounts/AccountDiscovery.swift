@@ -35,12 +35,20 @@ public enum AccountDiscovery {
         let accounts: [String: CuxAccount]
     }
 
-    public static func discover(cuxRoot: URL, credentialsFile: URL) -> [Account] {
+    public static func discover(cuxRoot: URL, credentialsFile: URL,
+                                keychainReader: (String) -> Data? = defaultKeychainReader) -> [Account] {
         if let accounts = discoverCux(root: cuxRoot), !accounts.isEmpty {
             return accounts
         }
         if FileManager.default.fileExists(atPath: credentialsFile.path) {
             return [Account(id: "default", alias: nil, email: nil, slot: nil,
+                            isActive: true, oauthURL: credentialsFile)]
+        }
+        // Current Claude Code versions may keep OAuth only in Keychain. Keep
+        // the credential path as a harmless placeholder: token(for:) falls
+        // through to the Keychain when the file is absent.
+        if keychainAccessToken(reader: keychainReader) != nil {
+            return [Account(id: "default", alias: "Claude Code", email: nil, slot: nil,
                             isActive: true, oauthURL: credentialsFile)]
         }
         return []

@@ -16,11 +16,17 @@ final class AppState {
     }
 
     private(set) var sessions: [SessionRecord] = []
+    private(set) var codexSessions: [SessionRecord] = []
     /// sessionId -> Claude Code session title (last ai-title in the transcript).
     private(set) var sessionTitles: [String: String] = [:]
     private var titleCheckedAt: [String: Date] = [:]
     private(set) var display: SessionRecord?
+    private(set) var previousLabelModel: MenuBarLabelModel?
+    private(set) var labelTransitionProgress: Double = 1
+    private var labelTransitionStartedAt: Date?
     private(set) var accounts: [Account] = []
+    private(set) var codexAccounts: [CodexAccount] = []
+    private(set) var codexUsage: [String: CodexUsageState] = [:]
     private(set) var currentVerb: String
     /// 1 Hz heartbeat for the menu bar elapsed counter; advances only while busy.
     private(set) var tick = Date()
@@ -30,11 +36,14 @@ final class AppState {
 
     private let cuxRefresher = CuxRefresher()
     private let cuxAccountSwitcher = CuxAccountSwitcher()
+    private let codexAccountStore = CodexAccountStore()
+    private let codexUsageClient = CodexUsageClient()
     private let updateChecker = UpdateChecker()
     private var verbCycler = VerbCycler()
     private var watcher: DirectoryWatcher?
     private var pollTask: Task<Void, Never>?
     private var reaggregateTask: Task<Void, Never>?
+    private var codexActivityTask: Task<Void, Never>?
     private var updateCheckTask: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
     private var tickInterval: Duration = .seconds(1)
@@ -45,6 +54,8 @@ final class AppState {
         .appendingPathComponent(".cux", isDirectory: true)
     private let credentialsFile = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".claude/.credentials.json")
+    private let codexSessionsRoot = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".codex/sessions", isDirectory: true)
 
     // `settings` defaults via `?? SettingsStore()` in the body, not as a parameter
     // default: a MainActor-isolated default-argument expression doesn't compile
@@ -65,6 +76,7 @@ final class AppState {
         try? paths.ensureDirs()
         usageStore.loadCache()
         accounts = AccountDiscovery.discover(cuxRoot: cuxRoot, credentialsFile: credentialsFile)
+        Task { [weak self] in await self?.refreshCodexUsage() }
         reaggregate()
 
         watcher = DirectoryWatcher(url: paths.sessionsDir) { [weak self] in
@@ -75,6 +87,12 @@ final class AppState {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
                 self?.reaggregate()
+            }
+        }
+        codexActivityTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.refreshCodexActivity()
+                try? await Task.sleep(for: .seconds(1))
             }
         }
         pollTask = Task { [weak self] in
@@ -94,12 +112,29 @@ final class AppState {
 
     func reaggregate() {
         sessions = SessionAggregator.loadSessions(from: paths.sessionsDir, now: Date())
-        let previous = display?.state
-        display = SessionAggregator.displayState(sessions)
-        if display?.state == .thinking, previous != .thinking {
+        codexSessions = CodexSessionAggregator.loadSessions(from: codexSessionsRoot, now: Date())
+        setDisplay(SessionAggregator.displayState(sessions + codexSessions))
+        refreshSessionTitles()
+    }
+
+    private func refreshCodexActivity() {
+        codexSessions = CodexSessionAggregator.loadSessions(from: codexSessionsRoot, now: Date())
+        setDisplay(SessionAggregator.displayState(sessions + codexSessions))
+    }
+
+    private func setDisplay(_ next: SessionRecord?) {
+        let oldModel = labelModel
+        let previousState = display?.state
+        display = next
+        if display?.state == .thinking, previousState != .thinking {
             currentVerb = verbCycler.next(from: settings.messageStyle.thinking)
         }
-        refreshSessionTitles()
+        let newModel = labelModel
+        if oldModel.activityText != newModel.activityText {
+            previousLabelModel = oldModel
+            labelTransitionProgress = 0
+            labelTransitionStartedAt = Date()
+        }
         updateTicker()
     }
 
@@ -121,7 +156,7 @@ final class AppState {
         }
     }
 
-    /// Drives the elapsed counter and shimmer while a session is busy — 30 fps
+    /// Drives the elapsed counter and shimmer while a session is busy — 15 fps
     /// when activity text is on the bar (the shimmer needs sub-second frames),
     /// 1 Hz for icon-only/compact styles. A plain task loop, not TimelineView:
     /// a periodic TimelineView in the MenuBarExtra label re-anchors its
@@ -129,9 +164,9 @@ final class AppState {
     /// always already due — the main thread spins at 100% CPU and the status
     /// item never finishes appearing (observed on macOS 26).
     private func updateTicker() {
-        if display?.busySince != nil {
+        if display?.busySince != nil || previousLabelModel != nil {
             let interval: Duration = displayStyle == .iconOnly || displayStyle == .compact
-                ? .seconds(1) : .milliseconds(33)
+                ? .seconds(1) : (display?.busySince == nil ? .milliseconds(33) : .milliseconds(67))
             guard tickTask == nil || interval != tickInterval else { return }
             tickTask?.cancel()
             tickInterval = interval
@@ -140,11 +175,22 @@ final class AppState {
                 while !Task.isCancelled {
                     try? await Task.sleep(for: interval)
                     self?.tick = Date()
+                    self?.advanceLabelTransition()
                 }
             }
         } else {
             tickTask?.cancel()
             tickTask = nil
+        }
+    }
+
+    private func advanceLabelTransition() {
+        guard let startedAt = labelTransitionStartedAt else { return }
+        labelTransitionProgress = min(1, Date().timeIntervalSince(startedAt) / 0.2)
+        if labelTransitionProgress >= 1 {
+            previousLabelModel = nil
+            labelTransitionStartedAt = nil
+            updateTicker()
         }
     }
 
@@ -177,6 +223,7 @@ final class AppState {
         // cache — ask cux to repoll it first or the mirror stays session-stale.
         await cuxRefresher.refreshIfNeeded(accounts: accounts)
         await usageStore.refresh(accounts: usageInputs(accounts))
+        await refreshCodexUsage()
     }
 
     /// Switches the active cux slot, then re-discovers accounts and refreshes
@@ -187,6 +234,38 @@ final class AppState {
         guard let slot = account.slot else { return }
         _ = await cuxAccountSwitcher.switchTo(slot: slot)
         await refreshUsageNow()
+    }
+
+    func switchCodexAccount(_ account: CodexAccount) async {
+        guard !account.isActive else { return }
+        _ = await codexAccountStore.switchTo(id: account.id)
+        await refreshCodexUsage()
+    }
+
+    func refreshCodexUsage() async {
+        let currentAccounts = await codexAccountStore.accounts()
+        let previousStates = codexUsage
+        var states: [String: CodexUsageState] = [:]
+        for account in currentAccounts {
+            guard let data = try? Data(contentsOf: account.authURL),
+                  let token = Self.codexAccessToken(from: data) else {
+                states[account.id] = .failed(previous: previousStates[account.id])
+                continue
+            }
+            do {
+                states[account.id] = CodexUsageState(snapshot: try await codexUsageClient.fetch(token: token))
+            } catch {
+                states[account.id] = .failed(previous: previousStates[account.id])
+            }
+        }
+        codexAccounts = currentAccounts
+        codexUsage = states
+    }
+
+    private static func codexAccessToken(from data: Data) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = root["tokens"] as? [String: Any] else { return nil }
+        return tokens["access_token"] as? String
     }
 
     /// Re-fetches only accounts flagged needs-relogin. Runs when the popover
@@ -218,9 +297,13 @@ final class AppState {
             let failures = usageStore.states[account.id]?.failureCount ?? 0
             return !UsageStore.shouldSkip(cycle: cycle, failureCount: failures)
         }
-        guard !due.isEmpty else { return }
+        guard !due.isEmpty else {
+            await refreshCodexUsage()
+            return
+        }
         await cuxRefresher.refreshIfNeeded(accounts: due)
         await usageStore.refresh(accounts: usageInputs(due))
+        await refreshCodexUsage()
     }
 
     /// Pairs each account with its token and, for tokenless cux slots, the

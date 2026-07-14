@@ -57,6 +57,20 @@ enum LabelComposite {
         }
     }
 
+    static func crossfade(from previous: NSImage, to current: NSImage, progress: Double) -> NSImage {
+        let alpha = max(0, min(1, progress))
+        let size = NSSize(width: max(previous.size.width, current.size.width), height: height)
+        return NSImage(size: size, flipped: false) { _ in
+            previous.draw(in: NSRect(x: size.width - previous.size.width, y: 0,
+                                    width: previous.size.width, height: height),
+                          from: .zero, operation: .sourceOver, fraction: 1 - alpha)
+            current.draw(in: NSRect(x: size.width - current.size.width, y: 0,
+                                   width: current.size.width, height: height),
+                         from: .zero, operation: .sourceOver, fraction: alpha)
+            return true
+        }
+    }
+
     /// Mirrors the popover's `UsageBar.color` convention so the status-bar
     /// percentage and the per-account bars agree on what "getting close"
     /// looks like. nil (no usage shown, or level unknown) keeps the default
