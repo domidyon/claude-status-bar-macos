@@ -18,6 +18,8 @@ struct ClaudeStatusBarApp: App {
         } label: {
             MenuBarLabelView(model: appState.labelModel,
                              icon: StatusIcon.icon(for: appState.display),
+                             previousModel: appState.previousLabelModel,
+                             transitionProgress: appState.labelTransitionProgress,
                              shimmerPhase: ShimmerText.phase(at: appState.tick),
                              normalColor: NSColor(hex: appState.settings.normalColorHex) ?? .systemGreen,
                              yellowColor: NSColor(hex: appState.settings.yellowColorHex) ?? .systemYellow,

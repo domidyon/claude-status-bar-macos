@@ -22,9 +22,9 @@ with multi-account support.
 - **Usage at a glance** — 5-hour and 7-day utilization for the active Claude
   account in the menu bar, color-coded (green / yellow ≥50% / red ≥80%,
   configurable).
-- **Multi-account** — discovers every account managed by
-  [cux](https://cux.inulute.com) under `~/.cux` (falls back to
-  `~/.claude/.credentials.json`); per-account usage bars in the popover.
+- **Multi-account** — add accounts natively (**Add Account** → `claude
+  /login`) and switch the active one in-process from the popover, each with
+  its own 5h/7d usage bars.
 - **Claude Code activity** — Clawd shows what your sessions are doing right
   now (thinking, editing, running…), with playful verbs and elapsed timers,
   driven by Claude Code hooks + file watching (no polling loop).
@@ -79,14 +79,20 @@ with multi-account support.
 
 5. **Multi-account usage (optional)**
 
-   Install [cux](https://cux.inulute.com) and add your accounts — the app
-   reads account slots straight from `~/.cux` (falling back to the single
-   account in `~/.claude/.credentials.json`). Each cux slot shows up as its
-   own row in the popover with 5h/7d usage bars; click **Switch** to make a
-   different slot active. If a row shows **re-login needed**, click
-   **Log in**: for a cux slot this runs `cux switch <slot> && cux /login`,
-   for the bare `~/.claude` account it runs `claude /login` — either opens a
-   terminal window to complete the OAuth flow.
+   The app manages multiple accounts natively — switching swaps the live
+   `Claude Code-credentials` Keychain item and `~/.claude.json`'s
+   `oauthAccount` block itself, with a per-account Keychain-backed vault for
+   the credentials of every account that isn't currently active. To add
+   another account, click **Add Account** in the popover, complete the
+   `claude /login` flow it opens in a terminal window, and the
+   newly-logged-in account is captured and added as its own row.
+
+   Each account shows up as its own row in the popover with 5h/7d usage
+   bars; click **Switch** to make a different account active in-process.
+   If a row shows **re-login needed**, click **Log in** — this switches that
+   account live first (so the credentials `claude /login` renews belong to
+   the right account, not whatever was active before), then opens a terminal
+   window to complete the OAuth flow.
 
 6. **Verify it works**
 
@@ -120,14 +126,17 @@ identity, generating it into your login keychain on first run if it doesn't
 already exist (`scripts/ensure-signing-identity.sh`). Keeping this identity
 stable across rebuilds — rather than ad-hoc signing, which re-derives its
 identity from the binary's own bytes every build — is what lets macOS
-Keychain "Always Allow" grants (e.g. for cux account credentials) survive
-rebuilding and reinstalling the app.
+Keychain "Always Allow" grants (e.g. for the live `Claude Code-credentials`
+item) survive rebuilding and reinstalling the app.
 
 ## Security notes
 
 - OAuth tokens are read from disk only at request time and sent only to
   `api.anthropic.com`. They are never logged, cached, or written elsewhere.
-- The app is not sandboxed (it must read `~/.claude` and `~/.cux`).
+- The app is not sandboxed (it must read `~/.claude`).
+- The app re-asserts its trust on the live `Claude Code-credentials` Keychain
+  item once per launch (skipped once already trusted), so macOS's "Always
+  Allow" grant survives across relaunches instead of re-prompting.
 - The hook binary always exits 0 and prints nothing, so it can never block
   or corrupt a Claude Code session.
 

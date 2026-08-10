@@ -14,6 +14,16 @@ struct MockFetcher: UsageFetching {
     }
 }
 
+private struct FailingFetcher: UsageFetching {
+    func fetch(token: String) async throws -> UsageSnapshot {
+        throw UsageError.network
+    }
+}
+
+private func tempCacheFile() -> URL {
+    FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+}
+
 private func snap(_ pct: Double) -> UsageSnapshot {
     UsageSnapshot(fiveHour: UsageWindow(utilization: pct),
                   sevenDay: UsageWindow(utilization: pct),
@@ -86,58 +96,15 @@ private func makeStore(_ results: [String: Result<UsageSnapshot, UsageError>]) -
         #expect(store.states["a"]?.snapshot == nil)
     }
 
-    // cux slot accounts carry no token in oauth.json (real tokens live in the
-    // Keychain); usage comes from cux's own cache, keyed by organizationUuid.
-
-    @Test func cuxCacheSnapshotFeedsUsageWithoutToken() async {
+    @Test func slotAccountWithoutTokenDoesNotFlagRelogin() async {
+        // A slot-having account with no token and no prior state means "no
+        // data yet", never "logged out" — see the `account.slot != nil`
+        // branch in `refresh`.
         let (store, cache) = makeStore([:])
         defer { try? FileManager.default.removeItem(at: cache.deletingLastPathComponent()) }
-        let now = Date()
-        let cached = UsageSnapshot(fiveHour: UsageWindow(utilization: 23),
-                                   sevenDay: UsageWindow(utilization: 65),
-                                   fetchedAt: now.addingTimeInterval(-60))
-        await store.refresh(accounts: [(account("a", slot: 1), nil, cached)], now: now)
-        #expect(store.states["a"]?.snapshot?.fiveHour?.utilization == 23)
-        #expect(store.states["a"]?.freshness == .fresh)
-        #expect(store.states["a"]?.needsRelogin == false)
-    }
-
-    @Test func oldCuxCacheSnapshotIsStale() async {
-        let (store, cache) = makeStore([:])
-        defer { try? FileManager.default.removeItem(at: cache.deletingLastPathComponent()) }
-        let now = Date()
-        let cached = UsageSnapshot(fiveHour: UsageWindow(utilization: 23), sevenDay: nil,
-                                   fetchedAt: now.addingTimeInterval(-UsageStore.cuxCacheFreshFor - 1))
-        await store.refresh(accounts: [(account("a", slot: 1), nil, cached)], now: now)
-        #expect(store.states["a"]?.snapshot?.fiveHour?.utilization == 23)
-        #expect(store.states["a"]?.freshness == .stale)
-        #expect(store.states["a"]?.needsRelogin == false)
-    }
-
-    @Test func cuxAccountWithoutCacheEntryDoesNotFlagRelogin() async {
-        // cux owns auth for slot accounts — a missing cache entry means
-        // "no data yet", never "logged out".
-        let (store, cache) = makeStore([:])
-        defer { try? FileManager.default.removeItem(at: cache.deletingLastPathComponent()) }
-        await store.refresh(accounts: [(account("a", slot: 1), nil, nil)])
+        await store.refresh(accounts: [(account("a", slot: 1), nil)])
         #expect(store.states["a"]?.needsRelogin == false)
         #expect(store.states["a"]?.snapshot == nil)
-    }
-
-    @Test func cachedSnapshotClearsPriorReloginFlag() async {
-        let (store, cache) = makeStore([:])
-        defer { try? FileManager.default.removeItem(at: cache.deletingLastPathComponent()) }
-        // Legacy state from before the cux-cache path shipped.
-        await store.refresh(accounts: [(account("a"), nil)])
-        #expect(store.states["a"]?.needsRelogin == true)
-
-        let now = Date()
-        let cached = UsageSnapshot(fiveHour: UsageWindow(utilization: 10), sevenDay: nil,
-                                   fetchedAt: now.addingTimeInterval(-60))
-        await store.refresh(accounts: [(account("a", slot: 1), nil, cached)], now: now)
-        #expect(store.states["a"]?.needsRelogin == false)
-        #expect(store.states["a"]?.failureCount == 0)
-        #expect(store.states["a"]?.freshness == .fresh)
     }
 
     @Test func cacheRoundTripLoadsAsStale() async {
@@ -176,5 +143,131 @@ private func makeStore(_ results: [String: Result<UsageSnapshot, UsageError>]) -
             #expect(UsageStore.shouldSkip(cycle: 7, failureCount: failures))
             #expect(UsageStore.shouldSkip(cycle: 9, failureCount: failures))
         }
+    }
+
+    @Test func needsReloginSurvivesACacheMissRefreshCycle() async {
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: tempCacheFile())
+        store.seedNeedsRelogin(["native-0"])
+
+        let account = Account(id: "native-0", alias: nil, email: nil, slot: 0,
+                              isActive: true, oauthURL: URL(fileURLWithPath: "/dev/null"))
+        await store.refresh(accounts: [(account: account, token: nil)])
+
+        #expect(store.states["native-0"]?.needsRelogin == true)
+    }
+
+    @Test func freshAccountWithNoPriorStateDefaultsToNoRelogin() async {
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: tempCacheFile())
+        let account = Account(id: "native-1", alias: nil, email: nil, slot: 1,
+                              isActive: false, oauthURL: URL(fileURLWithPath: "/dev/null"))
+        await store.refresh(accounts: [(account: account, token: nil)])
+
+        #expect(store.states["native-1"]?.needsRelogin == false)
+    }
+
+    @Test func seedNeedsReloginDoesNotOverwriteExistingState() {
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: tempCacheFile())
+        store.seedNeedsRelogin(["native-0"])
+        #expect(store.states["native-0"]?.needsRelogin == true)
+
+        // A second seed call must not stomp state that's since moved on
+        // (e.g. a successful fetch already cleared needsRelogin).
+        store.seedNeedsRelogin(["native-0"])
+        #expect(store.states["native-0"]?.needsRelogin == true)
+    }
+
+    // MARK: - shouldRefresh (popover-open / wake throttle)
+
+    @Test func shouldRefreshAllowedWhenNeverRefreshed() {
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: tempCacheFile())
+        #expect(store.shouldRefresh(now: Date(), minGap: 30))
+    }
+
+    @Test func shouldRefreshAllowedAtOrAfterMinGap() async {
+        let (store, cache) = makeStore(["tok": .success(snap(10))])
+        defer { try? FileManager.default.removeItem(at: cache.deletingLastPathComponent()) }
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        await store.refresh(accounts: [(account("a"), "tok")], now: t0)
+
+        #expect(store.shouldRefresh(now: t0.addingTimeInterval(30), minGap: 30))
+        #expect(store.shouldRefresh(now: t0.addingTimeInterval(45), minGap: 30))
+    }
+
+    @Test func shouldRefreshSkippedBeforeMinGap() async {
+        let (store, cache) = makeStore(["tok": .success(snap(10))])
+        defer { try? FileManager.default.removeItem(at: cache.deletingLastPathComponent()) }
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        await store.refresh(accounts: [(account("a"), "tok")], now: t0)
+
+        #expect(!store.shouldRefresh(now: t0.addingTimeInterval(29), minGap: 30))
+    }
+
+    @Test func failedRefreshDoesNotCountAsRecentSuccessForThrottle() async {
+        let (store, cache) = makeStore(["tok": .failure(.network)])
+        defer { try? FileManager.default.removeItem(at: cache.deletingLastPathComponent()) }
+        let t0 = Date(timeIntervalSince1970: 1_000)
+        await store.refresh(accounts: [(account("a"), "tok")], now: t0)
+
+        // A failed refresh must not start the throttle window — refreshing
+        // again a second later is still allowed.
+        #expect(store.shouldRefresh(now: t0.addingTimeInterval(1), minGap: 30))
+    }
+
+    // MARK: - apply(externalStates:) (token-slayer injection path)
+
+    @Test func applyInjectsExternalStatesById() {
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: tempCacheFile())
+        let state = AccountUsageState(snapshot: snap(33), freshness: .fresh, needsRelogin: false)
+        store.apply(externalStates: ["a": state])
+        #expect(store.states["a"]?.snapshot?.fiveHour?.utilization == 33)
+        #expect(store.states["a"]?.freshness == .fresh)
+    }
+
+    @Test func applyOverwritesExistingStateForSameId() async {
+        let (store, cache) = makeStore(["tok": .success(snap(10))])
+        defer { try? FileManager.default.removeItem(at: cache.deletingLastPathComponent()) }
+        await store.refresh(accounts: [(account("a"), "tok")])
+        #expect(store.states["a"]?.snapshot?.fiveHour?.utilization == 10)
+
+        store.apply(externalStates: ["a": AccountUsageState(snapshot: snap(77), freshness: .fresh)])
+        #expect(store.states["a"]?.snapshot?.fiveHour?.utilization == 77)
+    }
+
+    @Test func applySetsLastSuccessfulRefreshAtWhenNonEmpty() {
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: tempCacheFile())
+        let now = Date(timeIntervalSince1970: 5_000)
+        store.apply(externalStates: ["a": AccountUsageState(snapshot: snap(1), freshness: .fresh)], now: now)
+        #expect(!store.shouldRefresh(now: now.addingTimeInterval(1), minGap: 30))
+    }
+
+    @Test func applyWithEmptyStatesDoesNotDisturbThrottle() {
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: tempCacheFile())
+        store.apply(externalStates: [:], now: Date(timeIntervalSince1970: 5_000))
+        #expect(store.shouldRefresh(now: Date(timeIntervalSince1970: 5_001), minGap: 30))
+    }
+
+    @Test func markStaleDowngradesExistingFreshState() {
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: tempCacheFile())
+        store.apply(externalStates: ["a": AccountUsageState(snapshot: snap(1), freshness: .fresh)])
+        store.markStale(["a"])
+        #expect(store.states["a"]?.freshness == .stale)
+        #expect(store.states["a"]?.snapshot?.fiveHour?.utilization == 1)  // snapshot kept
+    }
+
+    @Test func markStaleIgnoresIdsWithNoExistingState() {
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: tempCacheFile())
+        store.markStale(["never-seen"])
+        #expect(store.states["never-seen"] == nil)
+    }
+
+    @Test func appliedStateSurvivesCacheRoundTrip() {
+        let cache = tempCacheFile()
+        defer { try? FileManager.default.removeItem(at: cache) }
+        let store = UsageStore(fetcher: FailingFetcher(), cacheFile: cache)
+        store.apply(externalStates: ["a": AccountUsageState(snapshot: snap(66), freshness: .fresh)])
+
+        let warm = UsageStore(fetcher: FailingFetcher(), cacheFile: cache)
+        warm.loadCache()
+        #expect(warm.states["a"]?.snapshot?.fiveHour?.utilization == 66)
     }
 }

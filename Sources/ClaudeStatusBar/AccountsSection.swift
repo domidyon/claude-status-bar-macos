@@ -10,24 +10,33 @@ struct AccountsSection: View {
     let yellowColor: Color
     let redColor: Color
     let now: Date
+    let switchFailedAccountId: String?
+    /// Stderr text from a failed slayer-mode switch; nil for a native-mode
+    /// failure, which falls back to `AccountRow`'s generic message.
+    let switchFailedMessage: String?
     let onSwitch: (Account) -> Void
+    let onRelogin: (Account) -> Void
+    let onAddAccount: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Accounts").font(.caption).foregroundStyle(.secondary)
             if accounts.isEmpty {
-                Text(CuxAvailability.isInstalled()
-                     ? "No Claude account found — log in with cux or Claude Code"
-                     : "No Claude account found — log in with claude /login")
+                Text("No Claude account found — log in with claude /login")
                     .font(.callout).foregroundStyle(.secondary)
             } else {
                 ForEach(accounts) { account in
                     AccountRow(account: account, state: states[account.id],
                                yellowAt: yellowAt, redAt: redAt, normalColor: normalColor,
                                yellowColor: yellowColor, redColor: redColor, now: now,
-                               showActiveBadge: accounts.count > 1, onSwitch: onSwitch)
+                               showActiveBadge: accounts.count > 1,
+                               switchFailed: switchFailedAccountId == account.id,
+                               switchFailedMessage: switchFailedAccountId == account.id ? switchFailedMessage : nil,
+                               onSwitch: onSwitch, onRelogin: onRelogin)
                 }
             }
+            Button("Add Account") { onAddAccount() }
+                .controlSize(.small)
         }
     }
 }
@@ -42,7 +51,10 @@ private struct AccountRow: View {
     let redColor: Color
     let now: Date
     let showActiveBadge: Bool
+    let switchFailed: Bool
+    let switchFailedMessage: String?
     let onSwitch: (Account) -> Void
+    let onRelogin: (Account) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -64,13 +76,17 @@ private struct AccountRow: View {
                 if state?.needsRelogin == true {
                     Label("re-login needed", systemImage: "exclamationmark.triangle")
                         .font(.caption2).foregroundStyle(.orange)
-                    Button("Log in") { TerminalLauncher.run(ReloginCommand.command(for: account)) }
+                    Button("Log in") { onRelogin(account) }
                         .controlSize(.small)
                 } else if state?.freshness == .fresh {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.caption2).foregroundStyle(.green)
                         .help("Logged in")
                 }
+            }
+            if switchFailed {
+                Text(switchFailedMessage ?? "Switch failed — check native-switch.log")
+                    .font(.caption2).foregroundStyle(.orange)
             }
             if let snapshot = state?.snapshot {
                 UsageBar(title: "5h", window: snapshot.fiveHour,

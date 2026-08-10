@@ -21,12 +21,16 @@ public enum ClawdIcon: String, CaseIterable, Equatable, Sendable {
 public enum StatusIcon {
     public static func icon(for record: SessionRecord?) -> ClawdIcon {
         guard let record else { return .idle }
-        switch record.state {
+        return icon(for: record.state, label: record.label)
+    }
+
+    public static func icon(for state: SessionState, label: String? = nil) -> ClawdIcon {
+        switch state {
         case .idle: return .idle
         case .thinking: return .thinking
         case .waiting: return .notification
         case .tool:
-            switch record.label {
+            switch label {
             case "Editing": return .typing
             case "Running": return .building
             case "Searching": return .debugger

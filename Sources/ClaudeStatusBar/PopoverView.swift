@@ -13,7 +13,13 @@ struct PopoverView: View {
                         .font(.caption).foregroundStyle(.orange)
                 }
                 SessionsSection(sessions: appState.sessions,
-                                titles: appState.sessionTitles, now: context.date)
+                                titles: appState.sessionTitles,
+                                billedAccounts: appState.sessionBilledAccounts, now: context.date)
+                Divider()
+                CodexAccountsSection(accounts: appState.codexAccounts, states: appState.codexUsage,
+                                     now: context.date, onSwitch: { account in
+                    Task { await appState.switchCodexAccount(account) }
+                })
                 Divider()
                 AccountsSection(accounts: appState.visibleAccounts,
                                 states: appState.usageStore.states,
@@ -22,9 +28,15 @@ struct PopoverView: View {
                                 yellowColor: Color(hex: appState.settings.yellowColorHex) ?? .yellow,
                                 redColor: Color(hex: appState.settings.redColorHex) ?? .red,
                                 now: context.date,
+                                switchFailedAccountId: appState.switchFailedAccountId,
+                                switchFailedMessage: appState.switchFailedMessage,
                                 onSwitch: { account in
                                     Task { await appState.switchAccount(account) }
-                                })
+                                },
+                                onRelogin: { account in
+                                    Task { await appState.beginRelogin(account) }
+                                },
+                                onAddAccount: { Task { await appState.beginAddAccount() } })
                 Divider()
                 HStack {
                     Button("Refresh") {
@@ -49,5 +61,12 @@ struct PopoverView: View {
         // after the user logs back in, instead of waiting out the poll
         // loop's failure backoff.
         .task { await appState.recheckReloginAccounts() }
+        // Also runs on every popover open, throttled (see
+        // refreshUsageIfNeeded()) so a quickly reopened popover shows
+        // current usage instead of waiting out the poll interval.
+        .task { await appState.refreshUsageIfNeeded() }
+        // Slayer-mode session annotation (billed_account per session); a
+        // cheap no-op call in native mode.
+        .task { await appState.refreshSessionAnnotations() }
     }
 }

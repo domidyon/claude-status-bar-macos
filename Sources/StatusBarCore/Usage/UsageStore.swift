@@ -24,6 +24,12 @@ public final class UsageStore {
     let fetcher: UsageFetching
     let cacheFile: URL
     public private(set) var states: [String: AccountUsageState] = [:]
+    /// Set only when `refresh(accounts:)` fetches at least one account
+    /// successfully — a call that only produced failures leaves this
+    /// untouched, so `shouldRefresh` never treats a failed attempt as a
+    /// reason to withhold a retry. Backs the popover-open / wake-from-sleep
+    /// throttle in `AppState` (see `shouldRefresh(now:minGap:)`).
+    public private(set) var lastSuccessfulRefreshAt: Date?
 
     public init(fetcher: UsageFetching, cacheFile: URL) {
         self.fetcher = fetcher
@@ -40,22 +46,12 @@ public final class UsageStore {
         return cycle % interval != 0
     }
 
-    /// A cux cache snapshot older than this shows as stale — cux's hooks
-    /// normally repoll within minutes, so a 30-minute-old entry means cux
-    /// hasn't been active.
-    public static let cuxCacheFreshFor: TimeInterval = 30 * 60
-
-    public func refresh(accounts: [(account: Account, token: String?)]) async {
-        await refresh(accounts: accounts.map { ($0.account, $0.token, nil) })
-    }
-
-    public func refresh(accounts: [(account: Account, token: String?, cached: UsageSnapshot?)],
-                        now: Date = Date()) async {
+    public func refresh(accounts: [(account: Account, token: String?)], now: Date = Date()) async {
         let fetcher = self.fetcher
         let fetched = await withTaskGroup(
             of: (String, Result<UsageSnapshot, UsageError>).self
         ) { group in
-            for (account, token, _) in accounts {
+            for (account, token) in accounts {
                 guard let token else { continue }
                 group.addTask {
                     do {
@@ -74,12 +70,14 @@ public final class UsageStore {
             return collected
         }
 
-        for (account, token, cached) in accounts {
+        var hadSuccess = false
+        for (account, token) in accounts {
             let id = account.id
             var state = states[id] ?? AccountUsageState()
             switch token.flatMap({ _ in fetched[id] }) {
             case .success(let snapshot):
                 state = AccountUsageState(snapshot: snapshot, freshness: .fresh)
+                hadSuccess = true
             case .failure(.unauthorized):
                 state.freshness = .stale
                 state.needsRelogin = true
@@ -87,22 +85,72 @@ public final class UsageStore {
             case .failure:
                 state.freshness = .stale
                 state.failureCount += 1
-            case nil:  // no token — cux slot account or missing credentials
-                if let cached {
-                    let fresh = now.timeIntervalSince(cached.fetchedAt) <= Self.cuxCacheFreshFor
-                    state = AccountUsageState(snapshot: cached,
-                                              freshness: fresh ? .fresh : .stale)
-                } else if account.slot != nil {
-                    // cux owns auth for slot accounts; a missing cache entry
-                    // means "no data yet", never "logged out".
-                    state.needsRelogin = false
+            case nil:  // no token — slot account or missing credentials
+                if account.slot != nil {
+                    // A slot-having account with no prior state defaults to
+                    // needsRelogin == false (via AccountUsageState()'s own
+                    // default) — but if this ID was pre-seeded via
+                    // seedNeedsRelogin (a migrated native account with no
+                    // vault backup), that flag must survive this cycle, not
+                    // be reset here.
                 } else {
                     state.needsRelogin = true
                 }
             }
             states[id] = state
         }
+        if hadSuccess { lastSuccessfulRefreshAt = now }
         saveCache()
+    }
+
+    /// Whether a caller (popover-open, wake-from-sleep) should trigger
+    /// `refresh(accounts:)` right now, or skip because usage data is still
+    /// recent enough — throttles those two triggers to at most once every
+    /// `minGap` seconds so repeatedly opening the popover doesn't hammer the
+    /// API. A failed refresh doesn't set `lastSuccessfulRefreshAt`, so it
+    /// never blocks a retry.
+    public func shouldRefresh(now: Date = Date(), minGap: TimeInterval = 30) -> Bool {
+        guard let last = lastSuccessfulRefreshAt else { return true }
+        return now.timeIntervalSince(last) >= minGap
+    }
+
+    /// Injects already-fetched state (e.g. mapped from a `token-slayer`
+    /// response) directly, bypassing `refresh(accounts:)`'s own network
+    /// fetch entirely — the slayer-mode caller has already talked to the
+    /// CLI, not this store's `fetcher`. Each id's prior state is replaced
+    /// outright (not merged), mirroring the fresh-success branch of
+    /// `refresh(accounts:)`.
+    public func apply(externalStates: [String: AccountUsageState], now: Date = Date()) {
+        for (id, state) in externalStates {
+            states[id] = state
+        }
+        if !externalStates.isEmpty { lastSuccessfulRefreshAt = now }
+        saveCache()
+    }
+
+    /// Downgrades existing states to `.stale` — the slayer-mode counterpart
+    /// to `refresh(accounts:)`'s own native failure branch (which does the
+    /// same `freshness = .stale` assignment), so a lost connection to
+    /// token-slayer dims the popover's rows the same way a lost network
+    /// connection dims a native account's. Ids with no existing state are
+    /// left alone: there's nothing to dim, and creating a bare stale entry
+    /// would wrongly imply the account was seen before.
+    public func markStale(_ ids: [String]) {
+        for id in ids {
+            guard var state = states[id] else { continue }
+            state.freshness = .stale
+            states[id] = state
+        }
+    }
+
+    /// Marks the given account ids as needing relogin, without disturbing
+    /// any id that already has state (e.g. from a completed fetch). Used by
+    /// `AppState.resolveAccounts()` right after loading a migrated native
+    /// account whose credential vault backup couldn't be read.
+    public func seedNeedsRelogin(_ ids: [String]) {
+        for id in ids where states[id] == nil {
+            states[id] = AccountUsageState(needsRelogin: true)
+        }
     }
 
     public func loadCache() {
